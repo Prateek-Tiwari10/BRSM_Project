@@ -1,0 +1,661 @@
+---
+title: "BRSM Hypotheses, Tests, and Results"
+author: "BRSM Project"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    fig_caption: true
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+format_pval <- function(p, threshold = 0.001) {
+  if (is.na(p)) return(NA_character_)
+  if (p < threshold) {
+    return(paste0("< ", threshold))
+  }
+  sprintf("%.4f", p)
+}
+
+get_first_col <- function(df, candidates) {
+  for (col_name in candidates) {
+    if (col_name %in% names(df)) {
+      return(df[[col_name]])
+    }
+  }
+  rep(NA, nrow(df))
+}
+```
+
+# Data Inputs (Used for All Tests)
+
+```{r load-packages}
+library(tidyverse)
+library(readxl)
+library(scales)
+library(ARTool)
+library(coin)
+library(lme4)
+library(car)
+```
+
+```{r load-demographics}
+input_file <- "/home/prateek-tiwari/BRSM_Project/datafile /Demographic data.xlsx"
+participant_data_dir <- "/home/prateek-tiwari/BRSM_Project/BRSM data csv"
+
+if (str_detect(str_to_lower(input_file), "\\.csv$")) {
+  demo_data_raw <- read_csv(input_file, show_col_types = FALSE)
+} else if (str_detect(str_to_lower(input_file), "\\.xlsx$")) {
+  demo_data_raw <- read_excel(input_file)
+} else {
+  stop("Unsupported input format. Use .csv or .xlsx")
+}
+
+# Build participant_id
+if (!"participant_id" %in% names(demo_data_raw)) {
+  demo_data <- demo_data_raw %>%
+    mutate(participant_id = str_to_lower(str_extract(`Sub ID`, "(?i)sub\\d+")))
+} else {
+  demo_data <- demo_data_raw %>%
+    mutate(participant_id = str_to_lower(participant_id))
+}
+
+demo_data <- demo_data %>%
+  filter(!is.na(participant_id) & participant_id != "")
+
+# Condition sync from filenames
+sync_files <- list.files(participant_data_dir, pattern = "\\.csv$", full.names = TRUE)
+filename_sync_lookup <- tibble(filepath = sync_files) %>%
+  mutate(
+    participant_id = str_to_lower(str_extract(basename(filepath), "(?i)sub\\d+")),
+    filename_cond = str_to_upper(str_trim(str_extract(basename(filepath), "(?i)(?<=_)(AB|NB)\\s*(?=_)")))
+  ) %>%
+  filter(!is.na(participant_id), !is.na(filename_cond)) %>%
+  distinct(participant_id, .keep_all = TRUE)
+
+demo_data <- demo_data %>%
+  mutate(
+    excel_cond = str_to_upper(str_trim(str_extract(`Sub ID`, "(?i)_(AB|NB)\\b"))) %>% str_remove("^_")
+  ) %>%
+  left_join(filename_sync_lookup %>% select(participant_id, filename_cond), by = "participant_id") %>%
+  mutate(
+    Condition = ifelse(!is.na(filename_cond), filename_cond, excel_cond)
+  ) %>%
+  select(-filename_cond, -excel_cond)
+```
+
+```{r exclusion-criterion}
+parse_num <- function(x) suppressWarnings(readr::parse_number(as.character(x)))
+participant_files_excl <- list.files(participant_data_dir, pattern = "\\.csv$", full.names = TRUE)
+
+encoding_records <- list()
+trial_records <- list()
+
+for (f in participant_files_excl) {
+  pid <- str_to_lower(str_extract(basename(f), "(?i)sub\\d+"))
+  dat <- read_csv(f, col_types = cols(.default = col_character()), show_col_types = FALSE)
+
+  rec_start <- if ("recognition.started" %in% names(dat)) min(parse_num(dat$`recognition.started`), na.rm = TRUE) else NA_real_
+  inst_stop <- if ("instruction_2.stopped" %in% names(dat)) min(parse_num(dat$`instruction_2.stopped`), na.rm = TRUE) else NA_real_
+
+  if (is.infinite(rec_start)) rec_start <- NA_real_
+  if (is.infinite(inst_stop)) inst_stop <- NA_real_
+
+  encoding_min <- ifelse(!is.na(rec_start) & !is.na(inst_stop), (rec_start - inst_stop) / 60, NA_real_)
+
+  encoding_records[[length(encoding_records) + 1]] <- tibble(
+    participant_id = pid,
+    encoding_minutes = encoding_min
+  )
+
+  if (all(c("movie_id", "resp.rt") %in% names(dat))) {
+    trial_tmp <- dat %>%
+      transmute(
+        participant_id = pid,
+        movie_id_num = parse_num(movie_id),
+        rt_sec = parse_num(`resp.rt`)
+      ) %>%
+      filter(!is.na(movie_id_num), movie_id_num >= 1, movie_id_num <= 40, !is.na(rt_sec))
+
+    trial_records[[length(trial_records) + 1]] <- trial_tmp
+  }
+}
+
+encoding_tbl <- if (length(encoding_records) > 0) {
+  bind_rows(encoding_records) %>% distinct(participant_id, .keep_all = TRUE)
+} else {
+  tibble(participant_id = character(), encoding_minutes = numeric())
+}
+
+trial_tbl <- if (length(trial_records) > 0) {
+  bind_rows(trial_records)
+} else {
+  tibble(participant_id = character(), movie_id_num = numeric(), rt_sec = numeric())
+}
+
+encoding_cutoff_min <- 27.05
+excluded_participants_tbl <- encoding_tbl %>%
+  filter(!is.na(encoding_minutes), encoding_minutes > encoding_cutoff_min)
+
+rt_mean <- mean(trial_tbl$rt_sec, na.rm = TRUE)
+rt_sd <- sd(trial_tbl$rt_sec, na.rm = TRUE)
+rt_upper_cutoff <- rt_mean + 3 * rt_sd
+```
+
+```{r build-analysis-data}
+participant_files_desc <- list.files(participant_data_dir, pattern = "\\.csv$", full.names = TRUE)
+
+read_desc_file <- function(filepath) {
+  fname <- basename(filepath)
+  pid <- str_to_lower(str_extract(fname, "(?i)sub\\d+"))
+  dat <- read_csv(filepath, col_types = cols(.default = col_character()), show_col_types = FALSE)
+  dat %>% mutate(participant_id = pid)
+}
+
+desc_raw <- map_dfr(participant_files_desc, read_desc_file)
+
+desc_trial <- desc_raw %>%
+  inner_join(demo_data %>% select(participant_id, Condition), by = "participant_id") %>%
+  mutate(
+    movie_id_num = suppressWarnings(readr::parse_number(movie_id)),
+    Accuracy = suppressWarnings(as.numeric(get_first_col(., c("resp.corr", "recogloop.resp.corr")))),
+    RT = suppressWarnings(as.numeric(str_trim(str_remove_all(get_first_col(., c("resp.rt", "recogloop.resp.rt", "key_resp_3.rt")), "[\\[\\]\\s]")))),
+    Confidence = suppressWarnings(as.numeric(get_first_col(., c("recogloop.conf_radio.response", "conf_radio.response", "confidence")))),
+    FrameType = case_when(
+      str_detect(target_img, "(?i)BB") ~ "BB",
+      str_detect(target_img, "(?i)EM") ~ "EM",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(participant_id), !is.na(Condition)) %>%
+  filter(!is.na(movie_id_num), movie_id_num >= 1, movie_id_num <= 40) %>%
+  filter(!is.na(Accuracy), Accuracy %in% c(0, 1)) %>%
+  filter(!participant_id %in% excluded_participants_tbl$participant_id) %>%
+  filter(is.na(RT) | (RT >= 0.2 & RT <= rt_upper_cutoff)) %>%
+  mutate(
+    Condition = factor(Condition, levels = c("NB", "AB")),
+    FrameType = factor(FrameType, levels = c("BB", "EM"))
+  )
+
+participant_level_desc <- desc_trial %>%
+  group_by(participant_id, Condition) %>%
+  summarise(mean_accuracy = mean(Accuracy, na.rm = TRUE), .groups = "drop")
+
+participant_frametype_desc <- desc_trial %>%
+  filter(!is.na(FrameType)) %>%
+  group_by(participant_id, Condition, FrameType) %>%
+  summarise(mean_accuracy = mean(Accuracy, na.rm = TRUE), .groups = "drop")
+```
+
+# Experimental Hypotheses H1–H8
+
+## H1: Condition Effect (NB > AB Accuracy)
+
+```{r h1-tests}
+participant_level_desc <- participant_level_desc %>%
+  mutate(Condition = factor(Condition, levels = c("NB", "AB")))
+
+m_art <- art(mean_accuracy ~ Condition, data = participant_level_desc)
+anova_art <- as.data.frame(anova(m_art))
+
+mw_result <- wilcox.test(mean_accuracy ~ Condition, data = participant_level_desc, conf.int = TRUE)
+
+perm_test <- oneway_test(mean_accuracy ~ Condition, data = participant_level_desc,
+                         distribution = approximate(nresample = 10000))
+
+overall_median <- median(participant_level_desc$mean_accuracy, na.rm = TRUE)
+median_table <- table(
+  participant_level_desc$Condition,
+  participant_level_desc$mean_accuracy > overall_median
+)
+med_test <- chisq.test(median_table)
+
+h1_summary <- tibble(
+  Test = c("ART ANOVA", "Mann-Whitney U", "Permutation Test", "Median Test"),
+  p_value = c(
+    format_pval(anova_art[1, "Pr(>F)"]),
+    format_pval(mw_result$p.value),
+    format_pval(as.numeric(coin::pvalue(perm_test))),
+    format_pval(med_test$p.value)
+  )
+)
+
+h1_summary
+```
+
+## H2: Boundary Advantage (BB vs EM)
+
+```{r h2-tests}
+h2_wide <- participant_frametype_desc %>%
+  select(participant_id, FrameType, mean_accuracy) %>%
+  pivot_wider(names_from = FrameType, values_from = mean_accuracy) %>%
+  filter(!is.na(BB), !is.na(EM))
+
+participant_frametype_desc <- participant_frametype_desc %>%
+  mutate(FrameType = factor(FrameType, levels = c("EM", "BB")))
+
+m_h2_art <- art(mean_accuracy ~ FrameType + (1|participant_id), data = participant_frametype_desc)
+anova_h2_art <- as.data.frame(anova(m_h2_art))
+
+h2_wilcoxon_result <- wilcox.test(h2_wide$BB, h2_wide$EM, paired = TRUE, conf.int = TRUE)
+
+h2_diffs <- h2_wide$BB - h2_wide$EM
+pos_diffs <- sum(h2_diffs > 0, na.rm = TRUE)
+total_valid <- sum(h2_diffs != 0, na.rm = TRUE)
+h2_sign_result <- binom.test(pos_diffs, total_valid, p = 0.5, alternative = "two.sided")
+
+h2_friedman_result <- friedman.test(as.matrix(h2_wide[, c("BB", "EM")]))
+
+h2_summary_tbl <- tibble(
+  Test = c("ART ANOVA", "Wilcoxon Signed-Rank", "Sign Test", "Friedman Test"),
+  p_value = c(
+    format_pval(anova_h2_art[1, "Pr(>F)"]),
+    format_pval(h2_wilcoxon_result$p.value),
+    format_pval(h2_sign_result$p.value),
+    format_pval(h2_friedman_result$p.value)
+  )
+)
+
+h2_summary_tbl
+```
+
+## H3: Event-Middle Stability (EM: NB vs AB)
+
+```{r h3-tests}
+h3_data <- participant_frametype_desc %>%
+  filter(FrameType == "EM") %>%
+  select(participant_id, Condition, mean_accuracy)
+
+m_h3_art <- art(mean_accuracy ~ Condition, data = h3_data)
+anova_h3_art <- as.data.frame(anova(m_h3_art))
+
+h3_mw_result <- wilcox.test(mean_accuracy ~ Condition, data = h3_data, conf.int = TRUE)
+
+h3_perm_test <- oneway_test(mean_accuracy ~ Condition, data = h3_data,
+                            distribution = approximate(nresample = 10000))
+
+set.seed(42)
+nb_em_vals <- h3_data$mean_accuracy[h3_data$Condition == "NB"]
+ab_em_vals <- h3_data$mean_accuracy[h3_data$Condition == "AB"]
+boot_diffs <- replicate(10000, {
+  mean(sample(nb_em_vals, replace = TRUE)) - mean(sample(ab_em_vals, replace = TRUE))
+})
+
+h3_ci_lower <- quantile(boot_diffs, 0.00625)
+h3_ci_upper <- quantile(boot_diffs, 0.99375)
+
+h3_summary_tbl <- tibble(
+  Test = c("ART ANOVA", "Mann-Whitney U", "Permutation Test", "Bootstrap (CI includes 0)"),
+  Result = c(
+    format_pval(anova_h3_art[1, "Pr(>F)"]),
+    format_pval(h3_mw_result$p.value),
+    format_pval(as.numeric(coin::pvalue(h3_perm_test))),
+    ifelse(h3_ci_lower < 0 & h3_ci_upper > 0, "Yes", "No")
+  )
+)
+
+h3_summary_tbl
+```
+
+## H4: Interaction (Boundary Advantage Stronger in NB)
+
+```{r h4-tests}
+h4_data <- participant_frametype_desc %>%
+  select(participant_id, Condition, FrameType, mean_accuracy) %>%
+  pivot_wider(names_from = FrameType, values_from = mean_accuracy) %>%
+  mutate(diff_score = BB - EM) %>%
+  filter(!is.na(diff_score))
+
+m_h4_art <- art(mean_accuracy ~ FrameType * Condition + (1|participant_id), data = participant_frametype_desc)
+anova_h4_art <- as.data.frame(anova(m_h4_art))
+
+h4_mw_result <- wilcox.test(diff_score ~ Condition, data = h4_data, conf.int = TRUE)
+
+h4_perm_test <- oneway_test(diff_score ~ Condition, data = h4_data,
+                            distribution = approximate(nresample = 10000))
+
+h4_friedman_result <- friedman.test(as.matrix(h4_data[, c("BB", "EM")]))
+
+h4_summary_tbl <- tibble(
+  Test = c("ART ANOVA (Interaction)", "Mann-Whitney (Advantage)", "Permutation Test", "Friedman Test"),
+  p_value = c(
+    format_pval(anova_h4_art["FrameType:Condition", "Pr(>F)"]),
+    format_pval(h4_mw_result$p.value),
+    format_pval(as.numeric(coin::pvalue(h4_perm_test))),
+    format_pval(h4_friedman_result$p.value)
+  )
+)
+
+h4_summary_tbl
+```
+
+## H5: Confidence–Accuracy Relationship
+
+```{r h5-tests}
+h5_data <- desc_trial %>%
+  filter(!is.na(Confidence), !is.na(Accuracy)) %>%
+  select(participant_id, Condition, Accuracy, Confidence) %>%
+  group_by(participant_id) %>%
+  mutate(Conf_z = as.numeric(scale(Confidence))) %>%
+  ungroup() %>%
+  filter(!is.na(Conf_z))
+
+nb_corr <- cor.test(h5_data$Confidence[h5_data$Condition == "NB"],
+                    h5_data$Accuracy[h5_data$Condition == "NB"], method = "spearman")
+ab_corr <- cor.test(h5_data$Confidence[h5_data$Condition == "AB"],
+                    h5_data$Accuracy[h5_data$Condition == "AB"], method = "spearman")
+
+h5_mw_conf <- wilcox.test(Confidence ~ Condition, data = h5_data)
+
+m_h5_glmm <- glmer(Accuracy ~ Conf_z * Condition + (1 | participant_id),
+                   data = h5_data, family = binomial)
+
+sum_h5_glmm <- as.data.frame(coef(summary(m_h5_glmm)))
+int_term <- grep("Conf_z:Condition", rownames(sum_h5_glmm), value = TRUE)
+h5_int_p <- if(length(int_term) > 0) sum_h5_glmm[int_term, "Pr(>|z|)"] else NA_real_
+
+set.seed(42)
+obs_diff <- nb_corr$estimate - ab_corr$estimate
+perm_diffs <- replicate(10000, {
+  shuffled_cond <- sample(h5_data$Condition)
+  cor(h5_data$Confidence[shuffled_cond == "NB"], h5_data$Accuracy[shuffled_cond == "NB"], method = "spearman") -
+    cor(h5_data$Confidence[shuffled_cond == "AB"], h5_data$Accuracy[shuffled_cond == "AB"], method = "spearman")
+})
+
+h5_perm_p <- mean(abs(perm_diffs) >= abs(obs_diff))
+
+h5_summary_tbl <- tibble(
+  Test = c("Spearman (NB)", "Spearman (AB)", "Mann-Whitney", "Interaction GLMM", "Permutation"),
+  Result = c(
+    sprintf("rho = %.3f, p = %s", nb_corr$estimate, format_pval(nb_corr$p.value)),
+    sprintf("rho = %.3f, p = %s", ab_corr$estimate, format_pval(ab_corr$p.value)),
+    sprintf("p = %s", format_pval(h5_mw_conf$p.value)),
+    sprintf("p = %s", format_pval(h5_int_p)),
+    sprintf("p = %s", format_pval(h5_perm_p))
+  )
+)
+
+h5_summary_tbl
+```
+
+## H6: Difficulty Moderation
+
+```{r h6-tests}
+stimulus_difficulty_map <- desc_trial %>%
+  group_by(movie_id_num) %>%
+  summarise(mean_acc = mean(Accuracy, na.rm = TRUE), .groups = "drop") %>%
+  mutate(Difficulty = factor(ifelse(mean_acc < median(mean_acc), "Hard", "Easy")))
+
+h6_trial_data <- desc_trial %>%
+  inner_join(stimulus_difficulty_map %>% select(movie_id_num, Difficulty), by = "movie_id_num")
+
+h6_diff_data <- h6_trial_data %>%
+  group_by(participant_id, FrameType, Difficulty) %>%
+  summarise(mean_acc = mean(Accuracy, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = FrameType, values_from = mean_acc) %>%
+  mutate(diff_score = BB - EM) %>%
+  filter(!is.na(diff_score))
+
+h6_kw_result <- kruskal.test(diff_score ~ Difficulty, data = h6_diff_data)
+
+m_h6_art <- art(Accuracy ~ FrameType * Difficulty + (1|participant_id), data = h6_trial_data)
+anova_h6_art <- as.data.frame(anova(m_h6_art))
+
+h6_mw_result <- wilcox.test(diff_score ~ Difficulty, data = h6_diff_data)
+
+h6_perm_test <- oneway_test(diff_score ~ factor(Difficulty), data = h6_diff_data,
+                            distribution = approximate(nresample = 10000))
+
+h6_summary_tbl <- tibble(
+  Test = c("Kruskal-Wallis", "ART ANOVA Interaction", "Mann-Whitney", "Permutation"),
+  p_value = c(
+    format_pval(h6_kw_result$p.value),
+    format_pval(anova_h6_art["FrameType:Difficulty", "Pr(>F)"]),
+    format_pval(h6_mw_result$p.value),
+    format_pval(as.numeric(coin::pvalue(h6_perm_test)))
+  )
+)
+
+h6_summary_tbl
+```
+
+## H7: Variability Effect (AB variance > NB variance)
+
+```{r h7-tests}
+h7_data <- participant_level_desc %>%
+  filter(!is.na(mean_accuracy)) %>%
+  select(participant_id, Condition, mean_accuracy)
+
+h7_levene_result <- car::leveneTest(mean_accuracy ~ Condition, data = h7_data)
+h7_bf_result <- car::leveneTest(mean_accuracy ~ Condition, data = h7_data, center = median)
+
+set.seed(42)
+sd_nb <- sd(h7_data$mean_accuracy[h7_data$Condition == "NB"])
+sd_ab <- sd(h7_data$mean_accuracy[h7_data$Condition == "AB"])
+obs_sd_diff <- sd_ab - sd_nb
+
+perm_sd_diffs <- replicate(10000, {
+  shuffled_cond <- sample(h7_data$Condition)
+  sd(h7_data$mean_accuracy[shuffled_cond == "AB"]) - sd(h7_data$mean_accuracy[shuffled_cond == "NB"])
+})
+
+h7_perm_p <- mean(perm_sd_diffs >= obs_sd_diff)
+
+boot_var_diffs <- replicate(10000, {
+  var(sample(h7_data$mean_accuracy[h7_data$Condition == "AB"], replace = TRUE)) -
+    var(sample(h7_data$mean_accuracy[h7_data$Condition == "NB"], replace = TRUE))
+})
+
+h7_ci_lower <- quantile(boot_var_diffs, 0.00625)
+h7_ci_upper <- quantile(boot_var_diffs, 0.99375)
+
+h7_summary_tbl <- tibble(
+  Test = c("Levene", "Brown-Forsythe", "Permutation", "Bootstrap (CI > 0)"),
+  Result = c(
+    format_pval(h7_levene_result[["Pr(>F)"]][1]),
+    format_pval(h7_bf_result[["Pr(>F)"]][1]),
+    format_pval(h7_perm_p),
+    ifelse(h7_ci_lower > 0, "Yes", "No")
+  )
+)
+
+h7_summary_tbl
+```
+
+## H8: Encoding Strength Effect
+
+```{r h8-tests}
+h8_diff_data <- participant_frametype_desc %>%
+  select(participant_id, FrameType, mean_accuracy) %>%
+  pivot_wider(names_from = FrameType, values_from = mean_accuracy) %>%
+  mutate(diff_score = BB - EM)
+
+h8_data <- h8_diff_data %>%
+  inner_join(encoding_tbl %>% select(participant_id, encoding_minutes), by = "participant_id") %>%
+  filter(!is.na(diff_score), !is.na(encoding_minutes))
+
+h8_spearman_result <- cor.test(h8_data$encoding_minutes, h8_data$diff_score, method = "spearman")
+
+m_h8_reg <- lm(diff_score ~ encoding_minutes, data = h8_data)
+sum_h8_reg <- summary(m_h8_reg)
+h8_reg_p <- coef(sum_h8_reg)[2, "Pr(>|t|)"]
+
+h8_data_split <- h8_data %>%
+  mutate(Encoding_Group = ifelse(encoding_minutes > median(encoding_minutes), "Longer", "Shorter"))
+
+h8_mw_result <- wilcox.test(diff_score ~ Encoding_Group, data = h8_data_split)
+
+set.seed(42)
+obs_corr <- cor(h8_data$encoding_minutes, h8_data$diff_score, method = "pearson")
+perm_corrs <- replicate(10000, {
+  cor(sample(h8_data$encoding_minutes), h8_data$diff_score, method = "pearson")
+})
+
+h8_perm_p <- mean(abs(perm_corrs) >= abs(obs_corr))
+
+h8_summary_tbl <- tibble(
+  Test = c("Spearman", "Linear Regression", "Median Split", "Permutation"),
+  Result = c(
+    sprintf("rho = %.3f", h8_spearman_result$estimate),
+    sprintf("p = %s", format_pval(h8_reg_p)),
+    sprintf("p = %s", format_pval(h8_mw_result$p.value)),
+    sprintf("p = %s", format_pval(h8_perm_p))
+  )
+)
+
+h8_summary_tbl
+```
+
+# Results Summary (Pass/Fail)
+
+```{r results-summary}
+# H1: primary decision from Mann-Whitney
+h1_pass <- mw_result$p.value < 0.05
+
+# H2: require >=2 significant tests and BB > EM
+h2_pvals <- c(
+  anova_h2_art[1, "Pr(>F)"],
+  h2_wilcoxon_result$p.value,
+  h2_sign_result$p.value,
+  h2_friedman_result$p.value
+)
+h2_sig_count <- sum(h2_pvals < 0.0125, na.rm = TRUE)
+bb_med <- median(h2_wide$BB, na.rm = TRUE)
+em_med <- median(h2_wide$EM, na.rm = TRUE)
+h2_pass <- h2_sig_count >= 2 && bb_med > em_med
+
+# H3: stability supported by non-significance and CI including 0
+h3_pvals <- c(
+  anova_h3_art[1, "Pr(>F)"],
+  h3_mw_result$p.value,
+  as.numeric(coin::pvalue(h3_perm_test))
+)
+h3_pass <- all(h3_pvals >= 0.0125, na.rm = TRUE) && (h3_ci_lower < 0 && h3_ci_upper > 0)
+
+# H4: interaction p-value
+h4_pass <- anova_h4_art["FrameType:Condition", "Pr(>F)"] < 0.0125
+
+# H5: difference in correlation strength
+h5_pass <- h5_perm_p < 0.0125
+
+# H6: difficulty moderation interaction
+h6_pass <- anova_h6_art["FrameType:Difficulty", "Pr(>F)"] < 0.0125
+
+# H7: variability effect
+h7_pass <- h7_levene_result[["Pr(>F)"]][1] < 0.0125
+
+# H8: encoding strength effect
+h8_pass <- h8_reg_p < 0.0125
+
+results_summary <- tibble(
+  Hypothesis = c("H1", "H2", "H3", "H4", "H5", "H6", "H7", "H8"),
+  Decision = c(
+    ifelse(h1_pass, "Pass", "Fail"),
+    ifelse(h2_pass, "Pass", "Fail"),
+    ifelse(h3_pass, "Pass", "Fail"),
+    ifelse(h4_pass, "Pass", "Fail"),
+    ifelse(h5_pass, "Pass", "Fail"),
+    ifelse(h6_pass, "Pass", "Fail"),
+    ifelse(h7_pass, "Pass", "Fail"),
+    ifelse(h8_pass, "Pass", "Fail")
+  )
+)
+
+results_summary
+```
+
+# Demographic Hypotheses and Tests
+
+```{r demo-merge}
+# Use complete demographic records only
+id_source <- if ("Sub ID" %in% names(demo_data_raw)) {
+  as.character(demo_data_raw$`Sub ID`)
+} else if ("participant_id" %in% names(demo_data_raw)) {
+  as.character(demo_data_raw$participant_id)
+} else {
+  rep(NA_character_, nrow(demo_data_raw))
+}
+
+demo_for_summary <- demo_data_raw %>%
+  select(-any_of("Condition")) %>%
+  mutate(
+    id_source = id_source,
+    participant_id = str_to_lower(str_extract(id_source, "(?i)sub\\d+")),
+    Age = suppressWarnings(as.numeric(Age)),
+    Gender = as.character(Gender),
+    Handedness = as.character(Handedness),
+    Vision = as.character(Vision)
+  ) %>%
+  left_join(demo_data %>% select(participant_id, Condition), by = "participant_id") %>%
+  filter(!is.na(participant_id), participant_id != "")
+
+demo_complete <- demo_for_summary %>%
+  filter(!is.na(Age))
+
+participant_demo <- participant_level_desc %>%
+  left_join(
+    demo_complete %>% select(participant_id, Age, Gender, Handedness, Vision),
+    by = "participant_id"
+  ) %>%
+  filter(!is.na(Age))
+```
+
+## D1: Age Balance (NB vs AB)
+
+```{r demo-test-d1-age-balance}
+age_NB <- participant_demo %>% filter(Condition == "NB") %>% pull(Age)
+age_AB <- participant_demo %>% filter(Condition == "AB") %>% pull(Age)
+
+td1 <- t.test(age_NB, age_AB, var.equal = FALSE)
+td1
+```
+
+## D2: Gender Balance (NB vs AB)
+
+```{r demo-test-d2-gender-balance}
+gender_table <- table(
+  participant_demo$Gender,
+  participant_demo$Condition
+)
+
+td2 <- chisq.test(gender_table)
+td2
+```
+
+## D3: Age as Moderator (Age x Accuracy)
+
+```{r demo-test-d3-age-accuracy}
+td3 <- cor.test(participant_demo$Age, participant_demo$mean_accuracy, method = "pearson")
+td3
+```
+
+## D4: Gender as Moderator (Accuracy by Gender)
+
+```{r demo-test-d4-gender-accuracy}
+acc_female <- participant_demo %>% filter(Gender == "Female") %>% pull(mean_accuracy)
+acc_male   <- participant_demo %>% filter(Gender == "Male") %>% pull(mean_accuracy)
+
+td4 <- t.test(acc_female, acc_male, var.equal = FALSE)
+td4
+```
+
+## Demographic Results Summary (Pass/Fail)
+
+```{r demo-results-summary}
+demo_results_summary <- tibble(
+  Hypothesis = c("D1", "D2", "D3", "D4"),
+  Decision = c(
+    ifelse(td1$p.value < 0.05, "Pass", "Fail"),
+    ifelse(td2$p.value < 0.05, "Pass", "Fail"),
+    ifelse(td3$p.value < 0.05, "Pass", "Fail"),
+    ifelse(td4$p.value < 0.05, "Pass", "Fail")
+  )
+)
+
+demo_results_summary
+```

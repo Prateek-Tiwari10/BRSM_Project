@@ -1,0 +1,1156 @@
+---
+title: "BRSM Data Processing and EDA"
+author: "BRSM Project"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    fig_caption: true
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+# Create directory for output plots if it doesn't exist
+if (!dir.exists("output_plots")) {
+  dir.create("output_plots")
+}
+
+# Helper function for professional p-value reporting
+format_pval <- function(p, threshold = 0.001) {
+  if (is.na(p)) return(NA_character_)
+  if (p < threshold) {
+    return(paste0("< ", threshold))
+  } else {
+    return(sprintf("%.4f", p))
+  }
+}
+
+# Safe column fetch for data sources with variant names
+get_first_col <- function(df, candidates) {
+  for (col_name in candidates) {
+    if (col_name %in% names(df)) {
+      return(df[[col_name]])
+    }
+  }
+  rep(NA, nrow(df))
+}
+```
+
+# PART I: DEMOGRAPHIC DATA PIPELINE
+
+## 1. Constraint Definition
+
+Missing values in the demographic dataset are filled only for valid participant entries.
+
+Rules:
+
+-   A row is valid only if participant_id (subId) is present.
+-   Rows where participant_id is missing or empty are removed before imputation.
+
+For data safety, this analysis uses the copy file:
+
+-   Demographic data.xlsx (Local project file)
+
+## 2. Load Data
+
+```{r load-data}
+library(tidyverse)
+library(readxl)
+library(writexl)
+library(scales)
+
+input_file <- "/home/prateek-tiwari/BRSM_Project/datafile /Demographic data.xlsx"
+
+if (str_detect(str_to_lower(input_file), "\\.csv$")) {
+  demo_data_raw <- read_csv(input_file, show_col_types = FALSE)
+} else if (str_detect(str_to_lower(input_file), "\\.xlsx$")) {
+  demo_data_raw <- read_excel(input_file)
+} else {
+  stop("Unsupported input format. Use .csv or .xlsx")
+}
+
+cat("Rows loaded:", nrow(demo_data_raw), "\n")
+cat("Columns loaded:", ncol(demo_data_raw), "\n")
+print(names(demo_data_raw))
+```
+
+## 3. Remove Invalid Rows (Critical Step)
+
+```{r build-and-filter-participant-id}
+# Build participant_id if not already present.
+# If participant_id already exists, keep it.
+if (!"participant_id" %in% names(demo_data_raw)) {
+  demo_data <- demo_data_raw %>%
+    mutate(participant_id = str_to_lower(str_extract(`Sub ID`, "(?i)sub\\d+")))
+} else {
+  demo_data <- demo_data_raw %>%
+    mutate(participant_id = str_to_lower(participant_id))
+}
+
+rows_before_filter <- nrow(demo_data)
+
+demo_data <- demo_data %>%
+  filter(!is.na(participant_id) & participant_id != "")
+
+rows_after_filter <- nrow(demo_data)
+
+cat("Rows before participant_id filter:", rows_before_filter, "\n")
+cat("Rows after participant_id filter:", rows_after_filter, "\n")
+cat("Rows removed due to invalid participant_id:", rows_before_filter - rows_after_filter, "\n")
+```
+
+## 3.1 Condition Synchronization and Correction (Filename Ground Truth)
+
+```{r condition-sync}
+# Get paths for CSV files
+participant_data_dir_sync <- if (dir.exists(file.path("/home/prateek-tiwari/BRSM_Project", "BRSM data csv"))) {
+  file.path("/home/prateek-tiwari/BRSM_Project", "BRSM data csv")
+} else {
+  "/home/prateek-tiwari/BRSM_Project/BRSM data csv"
+}
+sync_files <- list.files(participant_data_dir_sync, pattern = "\\.csv$", full.names = TRUE)
+
+# Create a lookup for conditions from filenames (Ground Truth)
+filename_sync_lookup <- tibble(filepath = sync_files) %>%
+  mutate(
+    participant_id = str_to_lower(str_extract(basename(filepath), "(?i)sub\\d+")),
+    # Extract AB or NB from filename
+    filename_cond = str_to_upper(str_trim(str_extract(basename(filepath), "(?i)(?<=_)(AB|NB)\\s*(?=_)")))
+  ) %>%
+  filter(!is.na(participant_id), !is.na(filename_cond)) %>%
+  distinct(participant_id, .keep_all = TRUE)
+
+# Extract conditions recorded in Excel (Sub ID column)
+demo_data <- demo_data %>%
+  mutate(
+    excel_cond = str_to_upper(str_trim(str_extract(`Sub ID`, "(?i)_(AB|NB)\\b"))) %>% str_remove("^_")
+  )
+
+# Join and detect mismatches
+demo_data <- demo_data %>%
+  left_join(filename_sync_lookup %>% select(participant_id, filename_cond), by = "participant_id")
+
+# Log corrections explicitly
+mismatches <- demo_data %>%
+  filter(!is.na(filename_cond), !is.na(excel_cond), filename_cond != excel_cond)
+
+if (nrow(mismatches) > 0) {
+  cat("\n--- CONDITION CORRECTIONS (Based on Filenames) ---\n")
+  for (i in 1:nrow(mismatches)) {
+    cat(sprintf("Updated %s: Excel (%s) -> Filename (%s)\n",
+                mismatches$participant_id[i], mismatches$excel_cond[i], mismatches$filename_cond[i]))
+  }
+  cat("-----------------------------------------------\n")
+}
+
+# Apply Ground Truth: Use Filename cond if available, otherwise fallback to Excel
+demo_data <- demo_data %>%
+  mutate(
+    Condition = ifelse(!is.na(filename_cond), filename_cond, excel_cond)
+  ) %>%
+  select(-filename_cond, -excel_cond)
+```
+
+## 4. Inspect Missing Values (Before Imputation)
+
+```{r missing-before}
+colSums(is.na(demo_data))
+```
+
+## 5. Define Mode Function
+
+```{r mode-function}
+get_mode <- function(x) {
+  x <- x[!is.na(x) & trimws(as.character(x)) != ""]
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+```
+
+## 6. Compute Replacement Values
+
+```{r replacement-values}
+age_median <- median(as.numeric(demo_data$Age), na.rm = TRUE)
+
+gender_mode <- get_mode(demo_data$Gender)
+hand_mode   <- get_mode(demo_data$Handedness)
+vision_mode <- get_mode(demo_data$Vision)
+
+cat("Age median:", age_median, "\n")
+cat("Gender mode:", gender_mode, "\n")
+cat("Handedness mode:", hand_mode, "\n")
+cat("Vision mode:", vision_mode, "\n")
+```
+
+## 7. Apply Imputation (Only Valid Rows)
+
+```{r apply-imputation}
+demo_clean <- demo_data %>%
+  mutate(
+    Age = as.numeric(Age),
+    Age = ifelse(is.na(Age), age_median, Age),
+    Gender = ifelse(is.na(Gender) | trimws(Gender) == "", gender_mode, Gender),
+    Handedness = ifelse(is.na(Handedness) | trimws(Handedness) == "", hand_mode, Handedness),
+    Vision = ifelse(is.na(Vision) | trimws(Vision) == "", vision_mode, Vision)
+  )
+```
+
+## 8. Verification
+
+```{r verification}
+colSums(is.na(demo_clean))
+```
+
+Expected result: no missing values in Age, Gender, Handedness, Vision for valid participant rows.
+
+## 9. Save Clean Data
+
+```{r save-clean-data}
+if (str_detect(str_to_lower(input_file), "\\.csv$")) {
+  write_csv(demo_clean, input_file)
+} else if (str_detect(str_to_lower(input_file), "\\.xlsx$")) {
+  write_xlsx(demo_clean, input_file)
+} else {
+  stop("Unsupported input format. Use .csv or .xlsx")
+}
+
+cat("Updated file in place:", input_file, "\n")
+```
+
+## 10. Summary
+
+```{r summary}
+summary_tbl <- tibble(
+  Metric = c(
+    "Rows loaded",
+    "Rows after participant_id validation",
+    "Rows removed for missing/empty participant_id",
+    "Missing Age after imputation",
+    "Missing Gender after imputation",
+    "Missing Handedness after imputation",
+    "Missing Vision after imputation"
+  ),
+  Value = c(
+    rows_before_filter,
+    rows_after_filter,
+    rows_before_filter - rows_after_filter,
+    sum(is.na(demo_clean$Age)),
+    sum(is.na(demo_clean$Gender) | trimws(demo_clean$Gender) == ""),
+    sum(is.na(demo_clean$Handedness) | trimws(demo_clean$Handedness) == ""),
+    sum(is.na(demo_clean$Vision) | trimws(demo_clean$Vision) == "")
+  )
+)
+
+summary_tbl
+```
+
+## 10B. Participant Demographics Summary (Demographic data.xlsx)
+
+```{r participant-demographics-summary}
+# Build a clean demographic summary table similar to the report style shown.
+
+id_source <- if ("Sub ID" %in% names(demo_data_raw)) {
+  as.character(demo_data_raw$`Sub ID`)
+} else if ("participant_id" %in% names(demo_data_raw)) {
+  as.character(demo_data_raw$participant_id)
+} else {
+  rep(NA_character_, nrow(demo_data_raw))
+}
+
+demo_for_summary <- demo_data_raw %>%
+  select(-any_of("Condition")) %>%
+  mutate(
+    id_source = id_source,
+    participant_id = str_to_lower(str_extract(id_source, "(?i)sub\\d+")),
+    Age_num = suppressWarnings(as.numeric(Age)),
+    Gender_chr = as.character(Gender),
+    Handedness_chr = as.character(Handedness),
+    Vision_chr = as.character(Vision)
+  ) %>%
+  left_join(demo_data %>% select(participant_id, Condition), by = "participant_id") %>%
+  filter(!is.na(participant_id), participant_id != "")
+
+demo_complete <- demo_for_summary %>%
+  filter(
+    !is.na(Age_num),
+    !is.na(Gender_chr) & trimws(Gender_chr) != "",
+    !is.na(Handedness_chr) & trimws(Handedness_chr) != "",
+    !is.na(Vision_chr) & trimws(Vision_chr) != ""
+  ) %>%
+  mutate(
+    Gender_std = case_when(
+      str_squish(str_to_lower(Gender_chr)) %in% c("female", "f") ~ "female",
+      str_squish(str_to_lower(Gender_chr)) %in% c("male", "m") ~ "male",
+      str_detect(str_squish(str_to_lower(Gender_chr)), "^female\\b") ~ "female",
+      str_detect(str_squish(str_to_lower(Gender_chr)), "^male\\b") ~ "male",
+      TRUE ~ "other"
+    ),
+    Handedness_std = case_when(
+      str_squish(str_to_lower(Handedness_chr)) %in% c("right", "r", "right-handed", "right handed") ~ "right",
+      str_squish(str_to_lower(Handedness_chr)) %in% c("left", "l", "left-handed", "left handed") ~ "left",
+      str_detect(str_squish(str_to_lower(Handedness_chr)), "^right") ~ "right",
+      str_detect(str_squish(str_to_lower(Handedness_chr)), "^left") ~ "left",
+      TRUE ~ "other"
+    ),
+    Vision_std = case_when(
+      str_detect(str_squish(str_to_lower(Vision_chr)), "uncorrected") ~ "uncorrected",
+      str_detect(str_squish(str_to_lower(Vision_chr)), "corrected") ~ "corrected",
+      str_squish(str_to_lower(Vision_chr)) %in% c("normal", "normal vision") ~ "normal",
+      str_detect(str_squish(str_to_lower(Vision_chr)), "normal") ~ "normal",
+      TRUE ~ "other"
+    )
+  )
+
+demo_summary_tbl <- tibble(
+  Characteristic = c(
+    "N (complete demographic records)",
+    "Age - Mean (SD)",
+    "Age - Range",
+    "Female",
+    "Male",
+    "Right-handed",
+    "Left-handed",
+    "Normal vision",
+    "Corrected to normal",
+    "Uncorrected vision difficulty"
+  ),
+  Value = c(
+    nrow(demo_complete),
+    sprintf("%.1f (%.1f)", mean(demo_complete$Age_num, na.rm = TRUE), sd(demo_complete$Age_num, na.rm = TRUE)),
+    sprintf("%d - %d", floor(min(demo_complete$Age_num, na.rm = TRUE)), ceiling(max(demo_complete$Age_num, na.rm = TRUE))),
+    sum(demo_complete$Gender_std == "female", na.rm = TRUE),
+    sum(demo_complete$Gender_std == "male", na.rm = TRUE),
+    sum(demo_complete$Handedness_std == "right", na.rm = TRUE),
+    sum(demo_complete$Handedness_std == "left", na.rm = TRUE),
+    sum(demo_complete$Vision_std == "normal", na.rm = TRUE),
+    sum(demo_complete$Vision_std == "corrected", na.rm = TRUE),
+    sum(demo_complete$Vision_std == "uncorrected", na.rm = TRUE)
+  )
+)
+
+condition_demo_tbl <- demo_complete %>%
+  filter(!is.na(Condition)) %>%
+  group_by(Condition) %>%
+  summarise(
+    N = n(),
+    `Age M` = round(mean(Age_num, na.rm = TRUE), 1),
+    `Age SD` = round(sd(Age_num, na.rm = TRUE), 1),
+    Female = sum(Gender_std == "female", na.rm = TRUE),
+    Male = sum(Gender_std == "male", na.rm = TRUE),
+    `Right-handed` = sum(Handedness_std == "right", na.rm = TRUE),
+    `Left-handed` = sum(Handedness_std == "left", na.rm = TRUE),
+    `Normal vision` = sum(Vision_std == "normal", na.rm = TRUE),
+    `Corrected to normal` = sum(Vision_std == "corrected", na.rm = TRUE),
+    `Uncorrected vision difficulty` = sum(Vision_std == "uncorrected", na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cat("Participant Demographics Summary\n")
+cat("------------------------------\n")
+cat("Total entries in Demographic data.xlsx:", nrow(demo_for_summary), "\n")
+cat("Complete demographic records used for summary:", nrow(demo_complete), "\n\n")
+
+demo_summary_tbl
+condition_demo_tbl
+```
+
+## 10A. Data Preprocessing Report
+
+```{r data-preprocessing-report}
+participant_data_dir <- if (dir.exists(file.path("/home/prateek-tiwari/BRSM_Project", "BRSM data csv"))) {
+  file.path("/home/prateek-tiwari/BRSM_Project", "BRSM data csv")
+} else {
+  "/home/prateek-tiwari/BRSM_Project/BRSM data csv"
+}
+participant_files_snapshot <- list.files(participant_data_dir, pattern = "\\.csv$", full.names = TRUE)
+participant_ids_snapshot <- str_to_lower(str_extract(basename(participant_files_snapshot), "(?i)sub\\d+"))
+participant_ids_snapshot <- participant_ids_snapshot[!is.na(participant_ids_snapshot)]
+
+demo_ids_snapshot <- demo_clean %>%
+  distinct(participant_id) %>%
+  pull(participant_id)
+
+matched_ids_snapshot <- intersect(participant_ids_snapshot, demo_ids_snapshot)
+csv_not_in_demo_snapshot <- setdiff(participant_ids_snapshot, demo_ids_snapshot)
+demo_not_in_csv_snapshot <- setdiff(demo_ids_snapshot, participant_ids_snapshot)
+
+cat("Current Data Processing Snapshot\n")
+cat("--------------------------------\n")
+cat("Total participant CSV files found:", length(participant_files_snapshot), "\n")
+cat("Unique participant IDs from CSV filenames:", length(unique(participant_ids_snapshot)), "\n")
+cat("Rows in Demographic data.xlsx (before participant_id filter):", rows_before_filter, "\n")
+cat("Rows in Demographic data.xlsx (after participant_id filter):", rows_after_filter, "\n")
+cat("Unique participant IDs in cleaned demographics (Demographic data.xlsx):", length(unique(demo_ids_snapshot)), "\n")
+cat("Participant IDs matched (CSV <-> demographics):", length(unique(matched_ids_snapshot)), "\n")
+cat("CSV participant IDs missing in demographics:", length(unique(csv_not_in_demo_snapshot)), "\n")
+cat("Demographic participant IDs missing in CSV:", length(unique(demo_not_in_csv_snapshot)), "\n")
+
+if (length(demo_not_in_csv_snapshot) > 0) {
+  cat("Example demographic IDs missing in CSV:", paste(head(demo_not_in_csv_snapshot, 10), collapse = ", "), "\n")
+}
+
+preprocessing_report <- tibble(
+  Metric = c(
+    "Total participant CSV files",
+    "Unique participant IDs from CSV filenames",
+    "Rows in Demographic data.xlsx before participant_id filter",
+    "Rows in Demographic data.xlsx after participant_id filter",
+    "Unique participant IDs in cleaned demographics",
+    "Matched participant IDs (CSV vs demographics)",
+    "CSV participant IDs missing in demographics",
+    "Demographic participant IDs missing in CSV"
+  ),
+  Value = c(
+    length(participant_files_snapshot),
+    length(unique(participant_ids_snapshot)),
+    rows_before_filter,
+    rows_after_filter,
+    length(unique(demo_ids_snapshot)),
+    length(unique(matched_ids_snapshot)),
+    length(unique(csv_not_in_demo_snapshot)),
+    length(unique(demo_not_in_csv_snapshot))
+  )
+)
+
+preprocessing_report
+```
+
+# PART II: BEHAVIORAL DATA PREPROCESSING & EXCLUSIONS
+
+## 11. Fill Participant CSV Files by Matching Sub ID
+
+```{r fill-participant-csvs-by-subid}
+# Folder containing one CSV per participant
+participant_data_dir <- if (dir.exists(file.path("/home/prateek-tiwari/BRSM_Project", "BRSM data csv"))) {
+  file.path("/home/prateek-tiwari/BRSM_Project", "BRSM data csv")
+} else {
+  "/home/prateek-tiwari/BRSM_Project/BRSM data csv"
+}
+participant_files <- list.files(participant_data_dir, pattern = "\\.csv$", full.names = TRUE)
+
+# Keep one cleaned demographic row per participant_id
+demo_lookup <- demo_clean %>%
+  distinct(participant_id, .keep_all = TRUE) %>%
+  transmute(
+    participant_id,
+    age_ref = Age,
+    gender_ref = Gender,
+    handedness_ref = Handedness,
+    vision_ref = Vision
+  )
+
+updated_files <- 0
+matched_files <- 0
+unmatched_files <- 0
+
+for (f in participant_files) {
+  # Match sub id from filename (example: sub17, sub150)
+  subid <- str_to_lower(str_extract(basename(f), "(?i)sub\\d+"))
+
+  if (is.na(subid) || !(subid %in% demo_lookup$participant_id)) {
+    unmatched_files <- unmatched_files + 1
+    next
+  }
+
+  ref <- demo_lookup %>% filter(participant_id == subid) %>% slice(1)
+
+  dat <- read_csv(f, col_types = cols(.default = col_character()), show_col_types = FALSE)
+
+  # Directly write demographic columns for this participant.
+  # Other columns are left unchanged.
+  if ("age" %in% names(dat)) {
+    dat$age <- as.character(ref$age_ref)
+  }
+  if ("gender" %in% names(dat)) {
+    dat$gender <- as.character(ref$gender_ref)
+  }
+  if ("handedness" %in% names(dat)) {
+    dat$handedness <- as.character(ref$handedness_ref)
+  }
+  if ("vision" %in% names(dat)) {
+    dat$vision <- as.character(ref$vision_ref)
+  }
+
+  write_csv(dat, f, na = "")
+  matched_files <- matched_files + 1
+  updated_files <- updated_files + 1
+}
+
+csv_fill_summary <- tibble(
+  Metric = c(
+    "Total participant CSV files found",
+    "Files with matched sub ID in demographics",
+    "Files updated in place",
+    "Files without demographic sub ID match"
+  ),
+  Value = c(
+    length(participant_files),
+    matched_files,
+    updated_files,
+    unmatched_files
+  )
+)
+
+csv_fill_summary
+```
+
+## 12. Exclusion Criterion
+
+```{r exclusion-criterion}
+# Criteria:
+# 1) Exclude participants with encoding time > 27.05 minutes
+# 2) Flag trials with RT < 0.2 s (200 ms)
+# 3) Flag trials with RT > mean + 3SD
+
+participant_data_dir <- if (dir.exists(file.path("/home/prateek-tiwari/BRSM_Project", "BRSM data csv"))) {
+  file.path("/home/prateek-tiwari/BRSM_Project", "BRSM data csv")
+} else {
+  "/home/prateek-tiwari/BRSM_Project/BRSM data csv"
+}
+participant_files_excl <- list.files(participant_data_dir, pattern = "\\.csv$", full.names = TRUE)
+
+parse_num <- function(x) suppressWarnings(readr::parse_number(as.character(x)))
+
+encoding_records <- list()
+trial_records <- list()
+
+for (f in participant_files_excl) {
+  pid <- str_to_lower(str_extract(basename(f), "(?i)sub\\d+"))
+  dat <- read_csv(f, col_types = cols(.default = col_character()), show_col_types = FALSE)
+
+  # Encoding time: recognition.started - instruction_2.stopped (in minutes)
+  rec_start <- if ("recognition.started" %in% names(dat)) min(parse_num(dat$`recognition.started`), na.rm = TRUE) else NA_real_
+  inst_stop <- if ("instruction_2.stopped" %in% names(dat)) min(parse_num(dat$`instruction_2.stopped`), na.rm = TRUE) else NA_real_
+
+  if (is.infinite(rec_start)) rec_start <- NA_real_
+  if (is.infinite(inst_stop)) inst_stop <- NA_real_
+
+  encoding_min <- ifelse(!is.na(rec_start) & !is.na(inst_stop), (rec_start - inst_stop) / 60, NA_real_)
+
+  encoding_records[[length(encoding_records) + 1]] <- tibble(
+    participant_id = pid,
+    encoding_minutes = encoding_min
+  )
+
+  # Trial-level RT extraction for criteria 2 and 3
+  if (all(c("movie_id", "resp.rt") %in% names(dat))) {
+    trial_tmp <- dat %>%
+      transmute(
+        participant_id = pid,
+        movie_id_num = parse_num(movie_id),
+        rt_sec = parse_num(`resp.rt`)
+      ) %>%
+      filter(!is.na(movie_id_num), movie_id_num >= 1, movie_id_num <= 40, !is.na(rt_sec))
+
+    trial_records[[length(trial_records) + 1]] <- trial_tmp
+  }
+}
+
+encoding_tbl <- if (length(encoding_records) > 0) {
+  bind_rows(encoding_records) %>% distinct(participant_id, .keep_all = TRUE)
+} else {
+  tibble(participant_id = character(), encoding_minutes = numeric())
+}
+
+trial_tbl <- if (length(trial_records) > 0) {
+  bind_rows(trial_records)
+} else {
+  tibble(participant_id = character(), movie_id_num = numeric(), rt_sec = numeric())
+}
+
+# Criterion 1
+encoding_cutoff_min <- 27.05
+excluded_participants_tbl <- encoding_tbl %>%
+  filter(!is.na(encoding_minutes), encoding_minutes > encoding_cutoff_min)
+
+# Criteria 2 and 3
+rt_mean <- mean(trial_tbl$rt_sec, na.rm = TRUE)
+rt_sd <- sd(trial_tbl$rt_sec, na.rm = TRUE)
+rt_upper_cutoff <- rt_mean + 3 * rt_sd
+
+rt_fast_tbl <- trial_tbl %>% filter(rt_sec < 0.2)
+rt_slow_tbl <- trial_tbl %>% filter(rt_sec > rt_upper_cutoff)
+
+cat("Exclusion / Flagging Summary\n")
+cat("----------------------------\n")
+cat("Total participant CSV files analyzed:", length(participant_files_excl), "\n")
+cat("Participants with valid encoding time:", sum(!is.na(encoding_tbl$encoding_minutes)), "\n")
+cat("Participants excluded (encoding > 27.05 min):", nrow(excluded_participants_tbl), "\n")
+cat("Total trial rows evaluated for RT:", nrow(trial_tbl), "\n")
+cat("Trials flagged as implausibly fast (RT < 0.2 s):", nrow(rt_fast_tbl), "\n")
+cat("RT mean (s):", round(rt_mean, 4), "\n")
+cat("RT SD (s):", round(rt_sd, 4), "\n")
+cat("RT upper cutoff (mean + 3SD):", round(rt_upper_cutoff, 4), "\n")
+cat("Trials flagged as slow outliers (RT > mean + 3SD):", nrow(rt_slow_tbl), "\n")
+
+exclusion_report <- tibble(
+  Criterion = c(
+    "Participants excluded: encoding time > 27.05 minutes",
+    "Trials flagged: RT < 0.2 s",
+    "Trials flagged: RT > mean + 3SD"
+  ),
+  Count = c(
+    nrow(excluded_participants_tbl),
+    nrow(rt_fast_tbl),
+    nrow(rt_slow_tbl)
+  )
+)
+
+exclusion_report
+```
+
+## 13. Post-Exclusion Data Present in BRSM Data CSV
+
+```{r post-exclusion-data-snapshot}
+# Apply all three exclusion criteria to create the post-exclusion dataset:
+# 1) Remove participants with encoding time > 27.05 min
+# 2) Remove trials with RT < 0.2 s
+# 3) Remove trials with RT > mean + 3SD
+
+excluded_participant_ids <- excluded_participants_tbl$participant_id
+
+post_exclusion_tbl <- trial_tbl %>%
+  filter(!participant_id %in% excluded_participant_ids) %>%
+  filter(rt_sec >= 0.2, rt_sec <= rt_upper_cutoff)
+
+cat("Post-Exclusion Data Snapshot\n")
+cat("----------------------------\n")
+cat("Original trial rows:", nrow(trial_tbl), "\n")
+cat("Trial rows after applying all exclusions:", nrow(post_exclusion_tbl), "\n")
+cat("Unique participants after exclusion:", n_distinct(post_exclusion_tbl$participant_id), "\n")
+
+post_exclusion_summary <- tibble(
+  Metric = c(
+    "Original trial rows",
+    "Trial rows after all exclusions",
+    "Unique participants after exclusion",
+    "Min RT after exclusion (s)",
+    "Max RT after exclusion (s)",
+    "Mean RT after exclusion (s)"
+  ),
+  Value = c(
+    nrow(trial_tbl),
+    nrow(post_exclusion_tbl),
+    n_distinct(post_exclusion_tbl$participant_id),
+    round(min(post_exclusion_tbl$rt_sec, na.rm = TRUE), 4),
+    round(max(post_exclusion_tbl$rt_sec, na.rm = TRUE), 4),
+    round(mean(post_exclusion_tbl$rt_sec, na.rm = TRUE), 4)
+  )
+)
+
+post_exclusion_summary
+
+cat("\nFirst 10 rows of post-exclusion data:\n")
+print(head(post_exclusion_tbl, 10))
+```
+
+Interpretation:
+
+-   Rows without participant_id were removed first.
+-   Missing values were filled only for valid participant rows.
+-   Imputation used median for Age and mode for categorical variables.
+-   Processing was performed on the copied file, not the original demographic source.
+-   Participant CSV files were then updated in place only where sub ID matched cleaned demographics.
+
+# PART III: DESCRIPTIVE STATISTICS & EDA
+
+## 14. Corrected Participant Demographics Summary (Final)
+
+```{r participant-demographics-summary-final}
+# Recompute at the end so the final report always shows corrected demographic values.
+
+id_source_final <- if ("Sub ID" %in% names(demo_data_raw)) {
+  as.character(demo_data_raw$`Sub ID`)
+} else if ("participant_id" %in% names(demo_data_raw)) {
+  as.character(demo_data_raw$participant_id)
+} else {
+  rep(NA_character_, nrow(demo_data_raw))
+}
+
+demo_for_summary_final <- demo_data_raw %>%
+  select(-any_of("Condition")) %>%
+  mutate(
+    id_source = id_source_final,
+    participant_id = str_to_lower(str_extract(id_source, "(?i)sub\\d+")),
+    Age_num = suppressWarnings(as.numeric(Age)),
+    Gender_chr = as.character(Gender),
+    Handedness_chr = as.character(Handedness),
+    Vision_chr = as.character(Vision)
+  ) %>%
+  left_join(demo_data %>% select(participant_id, Condition), by = "participant_id") %>%
+  filter(!is.na(participant_id), participant_id != "")
+
+demo_complete_final <- demo_for_summary_final %>%
+  filter(
+    !is.na(Age_num),
+    !is.na(Gender_chr) & trimws(Gender_chr) != "",
+    !is.na(Handedness_chr) & trimws(Handedness_chr) != "",
+    !is.na(Vision_chr) & trimws(Vision_chr) != ""
+  ) %>%
+  mutate(
+    Gender_std = case_when(
+      str_squish(str_to_lower(Gender_chr)) %in% c("female", "f") ~ "female",
+      str_squish(str_to_lower(Gender_chr)) %in% c("male", "m") ~ "male",
+      str_detect(str_squish(str_to_lower(Gender_chr)), "^female\\b") ~ "female",
+      str_detect(str_squish(str_to_lower(Gender_chr)), "^male\\b") ~ "male",
+      TRUE ~ "other"
+    ),
+    Handedness_std = case_when(
+      str_squish(str_to_lower(Handedness_chr)) %in% c("right", "r", "right-handed", "right handed") ~ "right",
+      str_squish(str_to_lower(Handedness_chr)) %in% c("left", "l", "left-handed", "left handed") ~ "left",
+      str_detect(str_squish(str_to_lower(Handedness_chr)), "^right") ~ "right",
+      str_detect(str_squish(str_to_lower(Handedness_chr)), "^left") ~ "left",
+      TRUE ~ "other"
+    ),
+    Vision_std = case_when(
+      str_detect(str_squish(str_to_lower(Vision_chr)), "uncorrected") ~ "uncorrected",
+      str_detect(str_squish(str_to_lower(Vision_chr)), "corrected") ~ "corrected",
+      str_squish(str_to_lower(Vision_chr)) %in% c("normal", "normal vision") ~ "normal",
+      str_detect(str_squish(str_to_lower(Vision_chr)), "normal") ~ "normal",
+      TRUE ~ "other"
+    )
+  )
+
+demo_summary_tbl_final <- tibble(
+  Characteristic = c(
+    "N (complete demographic records)",
+    "Age - Mean (SD)",
+    "Age - Range",
+    "Female",
+    "Male",
+    "Right-handed",
+    "Left-handed",
+    "Normal vision",
+    "Corrected to normal",
+    "Uncorrected vision difficulty"
+  ),
+  Value = c(
+    nrow(demo_complete_final),
+    sprintf("%.1f (%.1f)", mean(demo_complete_final$Age_num, na.rm = TRUE), sd(demo_complete_final$Age_num, na.rm = TRUE)),
+    sprintf("%d - %d", floor(min(demo_complete_final$Age_num, na.rm = TRUE)), ceiling(max(demo_complete_final$Age_num, na.rm = TRUE))),
+    sum(demo_complete_final$Gender_std == "female", na.rm = TRUE),
+    sum(demo_complete_final$Gender_std == "male", na.rm = TRUE),
+    sum(demo_complete_final$Handedness_std == "right", na.rm = TRUE),
+    sum(demo_complete_final$Handedness_std == "left", na.rm = TRUE),
+    sum(demo_complete_final$Vision_std == "normal", na.rm = TRUE),
+    sum(demo_complete_final$Vision_std == "corrected", na.rm = TRUE),
+    sum(demo_complete_final$Vision_std == "uncorrected", na.rm = TRUE)
+  )
+)
+
+condition_demo_tbl_final <- demo_complete_final %>%
+  filter(!is.na(Condition)) %>%
+  group_by(Condition) %>%
+  summarise(
+    N = n(),
+    `Age M` = round(mean(Age_num, na.rm = TRUE), 1),
+    `Age SD` = round(sd(Age_num, na.rm = TRUE), 1),
+    Female = sum(Gender_std == "female", na.rm = TRUE),
+    Male = sum(Gender_std == "male", na.rm = TRUE),
+    `Right-handed` = sum(Handedness_std == "right", na.rm = TRUE),
+    `Left-handed` = sum(Handedness_std == "left", na.rm = TRUE),
+    `Normal vision` = sum(Vision_std == "normal", na.rm = TRUE),
+    `Corrected to normal` = sum(Vision_std == "corrected", na.rm = TRUE),
+    `Uncorrected vision difficulty` = sum(Vision_std == "uncorrected", na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cat("Final Corrected Participant Demographics Summary\n")
+cat("---------------------------------------------\n")
+cat("Total entries in Demographic data.xlsx:", nrow(demo_for_summary_final), "\n")
+cat("Complete demographic records used for summary:", nrow(demo_complete_final), "\n\n")
+
+demo_summary_tbl_final
+condition_demo_tbl_final
+```
+
+## 15. Descriptive Statistics (Updated From Current Data)
+
+```{r build-descriptive-analysis-data, include=FALSE}
+# Re-read participant CSV files so descriptive statistics reflect current updated data.
+participant_data_dir_desc <- if (dir.exists(file.path("/home/prateek-tiwari/BRSM_Project", "BRSM data csv"))) {
+  file.path("/home/prateek-tiwari/BRSM_Project", "BRSM data csv")
+} else {
+  "/home/prateek-tiwari/BRSM_Project/BRSM data csv"
+}
+
+participant_files_desc <- list.files(participant_data_dir_desc, pattern = "\\.csv$", full.names = TRUE)
+
+read_desc_file <- function(filepath) {
+  fname <- basename(filepath)
+  pid <- str_to_lower(str_extract(fname, "(?i)sub\\d+"))
+
+  dat <- read_csv(filepath, col_types = cols(.default = col_character()), show_col_types = FALSE)
+
+  dat %>%
+    mutate(participant_id = pid)
+}
+
+desc_raw <- map_dfr(participant_files_desc, read_desc_file)
+
+# Integrate ground-truth Condition from demo_data
+desc_trial <- desc_raw %>%
+  inner_join(demo_data %>% select(participant_id, Condition), by = "participant_id") %>%
+  mutate(
+    movie_id_num = suppressWarnings(readr::parse_number(movie_id)),
+    Accuracy = suppressWarnings(as.numeric(get_first_col(., c("resp.corr", "recogloop.resp.corr")))),
+    RT = suppressWarnings(as.numeric(str_trim(str_remove_all(get_first_col(., c("resp.rt", "recogloop.resp.rt", "key_resp_3.rt")), "[\\[\\]\\s]")))),
+    Confidence = suppressWarnings(as.numeric(get_first_col(., c("recogloop.conf_radio.response", "conf_radio.response", "confidence")))),
+    FrameType = case_when(
+      str_detect(target_img, "(?i)BB") ~ "BB",
+      str_detect(target_img, "(?i)EM") ~ "EM",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(participant_id), !is.na(Condition)) %>%
+  filter(!is.na(movie_id_num), movie_id_num >= 1, movie_id_num <= 40) %>%
+  filter(!is.na(Accuracy), Accuracy %in% c(0, 1)) %>%
+  filter(!participant_id %in% excluded_participants_tbl$participant_id) %>%
+  filter(is.na(RT) | (RT >= 0.2 & RT <= rt_upper_cutoff)) %>%
+  mutate(
+    Condition = factor(Condition, levels = c("NB", "AB")),
+    FrameType = factor(FrameType, levels = c("BB", "EM"))
+  )
+
+participant_level_desc <- desc_trial %>%
+  group_by(participant_id, Condition) %>%
+  summarise(
+    mean_accuracy = mean(Accuracy, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+participant_frametype_desc <- desc_trial %>%
+  filter(!is.na(FrameType)) %>%
+  group_by(participant_id, Condition, FrameType) %>%
+  summarise(
+    mean_accuracy = mean(Accuracy, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+### 15.1 Overall Accuracy by Condition
+
+```{r desc-overall-accuracy-by-condition}
+overall_accuracy_by_condition <- participant_level_desc %>%
+  group_by(Condition) %>%
+  summarise(
+    N = n(),
+    Mean = round(mean(mean_accuracy, na.rm = TRUE), 3),
+    SD = round(sd(mean_accuracy, na.rm = TRUE), 3),
+    SE = round(SD / sqrt(N), 3),
+    Min = round(min(mean_accuracy, na.rm = TRUE), 3),
+    Max = round(max(mean_accuracy, na.rm = TRUE), 3),
+    .groups = "drop"
+  )
+
+overall_accuracy_by_condition
+```
+
+### 15.2 Accuracy by Condition and Frame Type
+
+```{r desc-accuracy-by-condition-frame-type}
+accuracy_by_condition_frametype <- participant_frametype_desc %>%
+  group_by(Condition, FrameType) %>%
+  summarise(
+    N = n(),
+    Mean = round(mean(mean_accuracy, na.rm = TRUE), 3),
+    SD = round(sd(mean_accuracy, na.rm = TRUE), 3),
+    SE = round(SD / sqrt(N), 3),
+    .groups = "drop"
+  )
+
+accuracy_by_condition_frametype
+```
+
+### 15.3 Reaction Time and Confidence by Condition
+
+```{r desc-rt-confidence-by-condition}
+rt_conf_by_condition <- desc_trial %>%
+  group_by(Condition) %>%
+  summarise(
+    N = n(),
+    Mean_RT = round(mean(RT, na.rm = TRUE), 2),
+    SD_RT = round(sd(RT, na.rm = TRUE), 2),
+    Mean_Conf = round(mean(Confidence, na.rm = TRUE), 2),
+    SD_Conf = round(sd(Confidence, na.rm = TRUE), 2),
+    .groups = "drop"
+  )
+
+rt_conf_by_condition
+```
+
+## 16. Exploratory Data Analysis (EDA)
+
+This section provides visual and statistical insights into experimental performance, following the high-fidelity distribution and comparison styles used in formal reporting.
+
+### 16.1 Distribution of Accuracy
+
+Exploring how participant accuracy is distributed within and across conditions.
+
+```{r eda-figures-1ab}
+if (nrow(participant_level_desc) > 0 && any(!is.na(participant_level_desc$Condition))) {
+  # Figure 1A: Histogram of Accuracy Faceted by Condition
+  p1a <- ggplot(participant_level_desc, aes(x = mean_accuracy, fill = Condition)) +
+    geom_histogram(bins = 12, color = "white", alpha = 0.8) +
+    facet_wrap(~Condition, ncol = 1, labeller = label_both) +
+    scale_x_continuous(labels = percent_format(), limits = c(0.4, 1.05)) +
+    scale_fill_manual(values = c("NB" = "#3182bd", "AB" = "#e6550d")) +
+    labs(title = "Histogram of Mean Recognition Accuracy per Participant",
+         subtitle = "One value per participant (mean proportion correct across ~40 trials)",
+         x = "Mean Accuracy (proportion correct)",
+         y = "Number of Participants") +
+    theme_classic() +
+    theme(legend.position = "none", strip.background = element_rect(fill = "#f0f0f0"))
+  p1a
+  ggsave("output_plots/accuracy_histogram.png", p1a, width = 8, height = 6)
+
+  # Figure 1B: Density Plot of Accuracy by Condition
+  p1b <- ggplot(participant_level_desc, aes(x = mean_accuracy, fill = Condition, color = Condition)) +
+    geom_density(alpha = 0.4, linewidth = 1) +
+    scale_x_continuous(labels = percent_format(), limits = c(0.4, 1.05)) +
+    scale_fill_manual(values = c("NB" = "#3182bd", "AB" = "#e6550d")) +
+    scale_color_manual(values = c("NB" = "#3182bd", "AB" = "#e6550d")) +
+    labs(title = "Density Plot of Mean Recognition Accuracy by Condition",
+         subtitle = "Smooth probability distribution; NB (blue) vs AB (red)",
+         x = "Mean Accuracy (proportion correct)",
+         y = "Density") +
+    theme_classic()
+  p1b
+  ggsave("output_plots/accuracy_density.png", p1b, width = 8, height = 6)
+} else {
+  cat("Skipping accuracy distribution plots: no valid participant data.\n")
+}
+```
+
+### 16.2 Comparison by Condition
+
+Directly comparing performance levels between Natural Blocking and Abrupt Blocking groups.
+
+```{r eda-figure-2}
+if (nrow(participant_level_desc) > 0 && any(!is.na(participant_level_desc$Condition))) {
+  p2 <- ggplot(participant_level_desc, aes(x = Condition, y = mean_accuracy, fill = Condition)) +
+    geom_violin(alpha = 0.5, color = "black") +
+    geom_boxplot(width = 0.15, fill = "white", alpha = 0.5, outlier.shape = NA) +
+    geom_jitter(width = 0.1, alpha = 0.4, size = 1.5) +
+    scale_y_continuous(labels = percent_format(), limits = c(0.4, 1.05)) +
+    scale_fill_manual(values = c("NB" = "#3182bd", "AB" = "#e6550d")) +
+    labs(title = "Violin Plot of Accuracy by Condition",
+         subtitle = "Shape = full distribution; inner box = median and IQR; dots = individual participants",
+         x = "Condition",
+         y = "Mean Accuracy") +
+    theme_classic() +
+    theme(legend.position = "none")
+  p2
+  ggsave("output_plots/accuracy_condition_violin.png", p2, width = 8, height = 6)
+} else {
+  cat("Skipping condition comparison plot: no valid participant data.\n")
+}
+```
+
+### 16.3 Comparison by Frame Type
+
+Evaluation of performance based on stimulus frame types (Boundary vs. Middle).
+
+```{r eda-figure-3a}
+if (nrow(participant_frametype_desc) > 0 && any(!is.na(participant_frametype_desc$FrameType))) {
+  p3a <- ggplot(participant_frametype_desc, aes(x = FrameType, y = mean_accuracy, fill = FrameType)) +
+    geom_violin(alpha = 0.5, color = "black") +
+    geom_boxplot(width = 0.15, fill = "white", alpha = 0.5, outlier.shape = NA) +
+    geom_jitter(width = 0.1, alpha = 0.4, size = 1.5) +
+    scale_y_continuous(labels = percent_format(), limits = c(0.4, 1.05)) +
+    scale_fill_manual(values = c("BB" = "#41ab5d", "EM" = "#feb24c")) +
+    labs(title = "Violin Plot of Accuracy by Frame Type",
+         subtitle = "BB = Boundary; EM = Event Middle; dots = individual participants",
+         x = "Frame Type",
+         y = "Mean Accuracy") +
+    theme_classic() +
+    theme(legend.position = "none")
+  p3a
+  ggsave("output_plots/accuracy_frametype_violin.png", p3a, width = 8, height = 6)
+} else {
+  cat("Skipping frame type plot: no valid frame type data.\n")
+}
+```
+
+### 16.4 Interaction Heatmap
+
+Visualizing the mean accuracy for each condition and frame type combination with exact values.
+
+```{r eda-figure-3b}
+if (nrow(participant_frametype_desc) > 0 && any(!is.na(participant_frametype_desc$Condition))) {
+  heatmap_summary <- participant_frametype_desc %>%
+    group_by(Condition, FrameType) %>%
+    summarise(MeanAcc = mean(mean_accuracy, na.rm = TRUE), .groups = "drop")
+
+  p3b <- ggplot(heatmap_summary, aes(x = FrameType, y = Condition, fill = MeanAcc)) +
+    geom_tile(color = "white", linewidth = 2) +
+    geom_text(aes(label = paste0(round(MeanAcc * 100, 1), "%")), color = "white", fontface = "bold", size = 8) +
+    scale_fill_gradient(low = "#ef8a62", high = "#67a9cf", labels = percent_format()) +
+    labs(title = "Heatmap of Mean Accuracy by Condition x Frame Type",
+         subtitle = "Percentage labels indicate exact group means; Blue = higher accuracy",
+         x = "Frame Type",
+         y = "Condition",
+         fill = "Mean Accuracy") +
+    theme_classic() +
+    theme(axis.line = element_blank())
+  p3b
+  ggsave("output_plots/accuracy_interaction_heatmap.png", p3b, width = 8, height = 6)
+} else {
+  cat("Skipping interaction heatmap: no valid frame type data.\n")
+}
+```
+
+### 16.5 Consistency and Variability
+
+Analysis of performance spread within groups.
+
+```{r eda-variability-enhanced}
+variability_summary <- participant_level_desc %>%
+  group_by(Condition) %>%
+  summarise(
+    N = n(),
+    SD = round(sd(mean_accuracy, na.rm = TRUE), 3),
+    IQR = round(IQR(mean_accuracy, na.rm = TRUE), 3),
+    Result_Range = paste0(round(min(mean_accuracy), 2), " - ", round(max(mean_accuracy), 2)),
+    .groups = "drop"
+  )
+
+variability_summary
+```
+
+### 16.6 Interaction Performance with 95% CI
+
+Detailed comparison of group means with 95% Confidence Intervals.
+
+```{r eda-figure-4}
+if (nrow(participant_frametype_desc) > 0 && any(!is.na(participant_frametype_desc$Condition))) {
+  ci_summary <- participant_frametype_desc %>%
+    group_by(Condition, FrameType) %>%
+    summarise(
+      N = n(),
+      MeanAcc = mean(mean_accuracy, na.rm = TRUE),
+      SD = sd(mean_accuracy, na.rm = TRUE),
+      # Calculate 95% CI using t-distribution
+      error = qt(0.975, df = N - 1) * (SD / sqrt(N)),
+      lower = MeanAcc - error,
+      upper = MeanAcc + error,
+      .groups = "drop"
+    )
+
+  p4 <- ggplot(ci_summary, aes(x = FrameType, y = MeanAcc, fill = Condition)) +
+    geom_bar(stat = "identity", position = position_dodge(0.8), width = 0.7, alpha = 0.8) +
+    geom_errorbar(aes(ymin = lower, ymax = upper),
+                  width = 0.2, position = position_dodge(0.8), color = "black") +
+    scale_y_continuous(labels = percent_format(), limits = c(0, 1.05)) +
+    scale_fill_manual(values = c("NB" = "#3182bd", "AB" = "#e6550d")) +
+    labs(title = "Mean Accuracy (+/- 95% CI) by Condition and Frame Type",
+         subtitle = "Error bars = 95% Confidence Interval (t-distribution, df = n - 1)",
+         x = "Frame Type",
+         y = "Mean Accuracy") +
+    theme_classic()
+  p4
+  ggsave("output_plots/accuracy_interaction_ci.png", p4, width = 8, height = 6)
+} else {
+  cat("Skipping interaction CI plot: no valid frame type data.\n")
+}
+```
+
+### 16.7 Age Distribution and Balance
+
+Checking for age balance between conditions.
+
+ggsave("output_plots/age_distribution.png", p5a, width = 8, height = 6)
+ggsave("output_plots/age_condition_boxplot.png", p5b, width = 8, height = 6)
+```{r eda-figures-5ab}
+if (nrow(demo_complete_final) > 0 && any(!is.na(demo_complete_final$Condition))) {
+  # Figure 5A: Age Histogram by Condition
+  p5a <- ggplot(demo_complete_final, aes(x = Age_num, fill = Condition)) +
+    geom_histogram(bins = 15, position = "dodge", alpha = 0.7) +
+    scale_fill_manual(values = c("NB" = "#3182bd", "AB" = "#e6550d")) +
+    labs(title = "Age Distribution by Condition",
+         subtitle = "Each bar = number of participants of that age; NB (blue) vs AB (red)",
+         x = "Age (years)",
+         y = "Number of Participants") +
+    theme_classic() +
+    theme(legend.position = "right")
+  p5a
+  ggsave("output_plots/age_distribution.png", p5a, width = 8, height = 6)
+
+  # Figure 5B: Age by Condition (Boxplot)
+  p5b <- ggplot(demo_complete_final, aes(x = Condition, y = Age_num, fill = Condition)) +
+    geom_boxplot(alpha = 0.5, outlier.shape = NA) +
+    geom_jitter(width = 0.1, alpha = 0.4, size = 1.5) +
+    scale_fill_manual(values = c("NB" = "#3182bd", "AB" = "#e6550d")) +
+    labs(title = "Age by Condition (Boxplot)",
+         subtitle = "Median, IQR, and individual participants; NB vs AB",
+         x = "Condition",
+         y = "Age (years)") +
+    theme_classic() +
+    theme(legend.position = "none")
+  p5b
+  ggsave("output_plots/age_condition_boxplot.png", p5b, width = 8, height = 6)
+} else {
+  cat("Skipping age plots: no valid demographic data.\n")
+}
+```
+
+### 16.8 Gender Breakdown and Composition
+
+Analyzing the gender balance within the participant sample.
+
+ggsave("output_plots/gender_breakdown.png", p5c, width = 8, height = 6)
+gender_comp <- demo_complete_final %>%
+ggsave("output_plots/gender_composition.png", p5d, width = 8, height = 6)
+```{r eda-figures-5cd}
+if (nrow(demo_complete_final) > 0 && any(!is.na(demo_complete_final$Gender_std))) {
+  # Figure 5C: Overall Gender Breakdown
+  gender_total <- demo_complete_final %>%
+    group_by(Gender_std) %>%
+    summarise(Count = n(), .groups = "drop") %>%
+    mutate(Perc = Count / sum(Count),
+           Label = paste0(Count, "\n(", percent(Perc, accuracy = 1), ")"),
+           Gender_std = str_to_title(Gender_std))
+
+  p5c <- ggplot(gender_total, aes(x = Gender_std, y = Count, fill = Gender_std)) +
+    geom_bar(stat = "identity", width = 0.6) +
+    geom_text(aes(label = Label), vjust = -0.5, fontface = "bold", size = 5) +
+    scale_fill_manual(values = c("Female" = "#e7298a", "Male" = "#377eb8", "Other" = "#999999")) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+    labs(title = "Gender Breakdown of Participants",
+         subtitle = "Full sample (complete demographic records only)",
+         x = "Gender",
+         y = "Number of Participants") +
+    theme_classic() +
+    theme(legend.position = "none", axis.line.y = element_blank(), axis.ticks.y = element_blank())
+  p5c
+  ggsave("output_plots/gender_breakdown.png", p5c, width = 8, height = 6)
+
+  # Figure 5D: Gender Composition by Condition
+  gender_comp <- demo_complete_final %>%
+    group_by(Condition, Gender_std) %>%
+    summarise(Count = n(), .groups = "drop_last") %>%
+    mutate(Perc = Count / sum(Count),
+           Label = paste0(Count, "\n(", percent(Perc, accuracy = 1), ")"),
+           Gender_std = str_to_title(Gender_std))
+
+  p5d <- ggplot(gender_comp, aes(x = Condition, y = Perc, fill = Gender_std)) +
+    geom_bar(stat = "identity", position = "fill", width = 0.7, alpha = 0.9) +
+    geom_text(aes(label = Label), position = position_stack(vjust = 0.5), color = "white", fontface = "bold", size = 4) +
+    scale_y_continuous(labels = percent_format()) +
+    scale_fill_manual(values = c("Female" = "#e7298a", "Male" = "#377eb8", "Other" = "#999999")) +
+    labs(title = "Gender Composition by Condition",
+         subtitle = "Proportional stacked bar; numbers = count and percentage within condition",
+         x = "Condition",
+         y = "Proportion of Participants",
+         fill = "Gender") +
+    theme_classic()
+  p5d
+  ggsave("output_plots/gender_composition.png", p5d, width = 8, height = 6)
+} else {
+  cat("Skipping gender plots: no valid demographic data.\n")
+}
+```
