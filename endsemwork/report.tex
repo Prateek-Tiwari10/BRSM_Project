@@ -204,7 +204,7 @@ NB & 94 & 22.2 & 2.2 & 23 \\
 \end{table}
 
 
-\begin{table}[!t]
+\begin{table}[H]
 \centering
 \small
 \caption{Overall accuracy by condition}
@@ -251,6 +251,7 @@ AB & 3072 & 5.31 & 2.83 & 4.09 & 1.17 \\
 \FloatBarrier
 
 \section{Exploratory Data Analysis}
+\noindent\textbf{Note:} This section was done and submitted in the mid-sem report.
 
 \begin{figure}[htbp]
 \centering
@@ -317,6 +318,9 @@ AB & 3072 & 5.31 & 2.83 & 4.09 & 1.17 \\
 \FloatBarrier
 \section{Hypothesis Testing}
 We used a multi-test nonparametric approach for H1--H8 to capture robust effects without strong distributional assumptions. Each hypothesis reports the set of tests used and a concise inference. Pass/fail decisions follow the summary table at the end of this section.
+\vspace{0.2cm}
+\noindent\textbf{Mid-semester note:} In the mid-sem report, we assumed normality and used parametric tests for H1--H3. Specifically: H1 (Overall Recognition Accuracy) used Welch's independent-samples t-test and Cohen's d; H2 (Before-Boundary Frame Accuracy) used a t-test on BB frames and Cohen's d; H3 (Event-Middle Frame Accuracy) used a t-test on EM frames and Cohen's d. Demographic hypotheses D1--D3 were also tested in the mid-sem submission.
+\noindent\textbf{Mid-semester test set:} The following four statistical tests were conducted to evaluate our experimental hypotheses. Each test used Welch's independent-samples t-test (no equal-variance assumption) and Cohen's d to quantify effect size magnitude. Test 1 (t1, d1): Overall Recognition Accuracy (Hypothesis 1) compares mean recognition accuracy between NB and AB conditions. t1 is the t-statistic and d1 is Cohen's d. Prediction: NB $>$ AB, large effect. Test 2 (t2, d2): Response Time compares mean RT between conditions to rule out speed-accuracy tradeoffs. t2 is the t-statistic and d2 is Cohen's d. Prediction: no significant difference. Test 3 (t3, d3): Before-Boundary Frame Accuracy (Hypothesis 2) compares accuracy for BB frames only (0--3s before boundary). t3 is the t-statistic for BB trials and d3 is Cohen's d. Prediction: NB $>$ AB, very large effect (d $>$ 1.0). Test 4 (t4, d4): Event-Middle Frame Accuracy (Hypothesis 3) compares accuracy for EM frames only. t4 is the t-statistic for EM trials and d4 is Cohen's d. Prediction: NB approx AB, minimal effect (d $<$ 0.3).
 
 \subsection{H1: Condition Effect (NB $>$ AB Accuracy)}
 \begin{table}[htbp]
@@ -499,8 +503,10 @@ H8 & Fail \\
 \end{tabular}}
 \end{table}
 
+\FloatBarrier
+
 \subsection{Demographic Results (D1--D3)}
-\begin{table}[!t]
+\begin{table}[!h]
 \centering
 \caption{Demographic decisions}
 \makebox[\columnwidth][c]{\begin{tabular}{ll}
@@ -513,8 +519,6 @@ D3 & Fail \\
 \bottomrule
 \end{tabular}}
 \end{table}
-\FloatBarrier
-
 \FloatBarrier
 \section{Conclusion and Key Findings}
 \begin{itemize}
@@ -545,8 +549,9 @@ K. M. Swallow et al. 2009.
 \end{thebibliography}
 
 
+\FloatBarrier
 \section{Individual Contributions}
-\begin{table}[!b]
+\begin{table}[H]
 \centering
 \small
 \renewcommand{\arraystretch}{1.2}
